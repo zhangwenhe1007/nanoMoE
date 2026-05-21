@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+checkpoints/
+*.pt
+*.pth
+
+mixed_train.txt
+medium_train.txt
+instruction_train.txt
+codex.md
+*.tokens.pt
