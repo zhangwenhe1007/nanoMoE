@@ -123,6 +123,10 @@ def main():
 
     random.seed(args.seed)
 
+    # TODO(nanoDSV4-data): move this mixture into a versioned manifest with
+    # source weights, filters, license notes, and held-out eval contamination
+    # checks. If the model is incoherent, first improve this mixture and train
+    # longer before blaming the architecture.
     sources = [
         make_source("fineweb_edu", 0.60, "HuggingFaceFW/fineweb-edu", format_plain_text, config="sample-10BT"),
         make_source("cosmopedia", 0.20, "HuggingFaceTB/cosmopedia", format_plain_text, config=args.cosmopedia_config),

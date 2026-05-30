@@ -1,6 +1,7 @@
 import torch
 import tiktoken
 import argparse
+from config import normalize_model_config
 from model import GPT
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -18,16 +19,16 @@ args = parser.parse_args()
 
 checkpoint_path = args.checkpoint
 
-enc = tiktoken.get_encoding("gpt2")
-vocab_size = enc.n_vocab
+fallback_enc = tiktoken.get_encoding("gpt2")
+vocab_size = fallback_enc.n_vocab
 
 checkpoint = torch.load(checkpoint_path, map_location=device)
 
 if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-    model_config = checkpoint["model_config"]
+    model_config = normalize_model_config(checkpoint["model_config"])
     state = checkpoint["model_state_dict"]
 else:
-    model_config = {
+    model_config = normalize_model_config({
         "vocab_size": vocab_size,
         "block_size": 512,
         "d_model": 512,
@@ -36,14 +37,15 @@ else:
         "n_kv_heads": 2,
         "mode": "gqa",
         "pos_encoding": "rope",
-        # TODO(MoE): include dense fallback defaults for MoE config fields so
-        # legacy dense checkpoints and new sparse checkpoints can share inference.
-    }
+    })
     state = checkpoint
 
-# TODO(MoE): reconstruct the exact MoE layout from model_config. Generation should
-# ignore training-only aux losses while still exposing optional router stats for
-# debugging expert specialization.
+enc = tiktoken.get_encoding(model_config.get("tokenizer_name", "gpt2"))
+
+# TODO(nanoDSV4-inference): generation should reconstruct the exact MLA/MoE/
+# sparse-attention layout from model_config, use compressed KV caches for MLA,
+# ignore training-only aux losses, and optionally print router utilization,
+# active experts, CSA/HCA selected blocks, and KV-cache memory per token.
 model = GPT(
     vocab_size=model_config["vocab_size"],
     block_size=model_config["block_size"],
@@ -53,6 +55,7 @@ model = GPT(
     n_kv_heads=model_config["n_kv_heads"],
     mode=model_config["mode"],
     pos_encoding=model_config["pos_encoding"],
+    model_config=model_config,
 )
 
 model.load_state_dict(state)

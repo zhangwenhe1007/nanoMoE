@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import numpy as np
 
 
 #Attention helpers
@@ -68,57 +67,94 @@ class RMSNorm(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, d_model, n_heads, n_layers, n_kv_heads=None, mode="mha", use_rope=True):
+    def __init__(self, d_model, n_heads, n_layers, n_kv_heads=None, mode="mha", use_rope=True, config=None):
         super().__init__()
+        self.config = config or {}
+        self.last_aux_loss = None
+        self.last_stats = {}
 
-        # TODO(MoE): thread MoE options through this constructor and pass layer_id
-        # into each block so we can start with MoE every other layer, then compare
-        # dense-only, all-MoE, and mixed dense/MoE stacks.
+        # TODO(nanoDSV4-depth): assign each layer an attention/MLP role from the
+        # config. Target ladder:
+        # 1. dense/GQA baseline
+        # 2. MLA in all attention layers
+        # 3. MLA + DeepSeekMoE in selected MLP layers
+        # 4. MLA + DeepSeekMoE + alternating dense/sliding/CSA/HCA attention
+        # 5. optional mHC or attention residuals for deeper stacks.
         self.blocks = nn.ModuleList([
-            TransformerBlock(d_model, n_heads, use_rope, n_kv_heads, mode) for _ in range(n_layers)
+            TransformerBlock(
+                d_model,
+                n_heads,
+                use_rope,
+                n_kv_heads,
+                mode,
+                layer_id=layer_id,
+                config=self.config,
+            )
+            for layer_id in range(n_layers)
         ])
 
     def forward(self, x, mask=None):
-        # TODO(MoE): aggregate per-layer aux loss, z-loss, router entropy, expert
-        # token counts, and overflow/drop stats here for training logs.
+        aux_losses = []
+        layer_stats = []
         for block in self.blocks:
             x = block(x, mask)
+
+            if block.last_aux_loss is not None:
+                aux_losses.append(block.last_aux_loss)
+            if block.last_stats:
+                layer_stats.append(block.last_stats)
+
+        self.last_aux_loss = None
+        if aux_losses:
+            self.last_aux_loss = sum(aux_losses)
+        self.last_stats = {"layers": layer_stats} if layer_stats else {}
         return x
     
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model, n_heads, use_rope, n_kv_heads=None, mode="mha"):
+    def __init__(self, d_model, n_heads, use_rope, n_kv_heads=None, mode="mha", layer_id=0, config=None):
         super().__init__()
+        self.layer_id = layer_id
+        self.config = config or {}
+        self.last_aux_loss = None
+        self.last_stats = {}
+
         #layernorm, mha, residual add, layernorm, mlp, residual add. x6
         #self.ln1 = nn.LayerNorm(d_model)
         self.ln1 = RMSNorm(d_model)
 
-        if (mode == "mha"):
-            self.attn = MultiHeadAttention(d_model, n_heads, use_rope)
-        elif (mode == "gqa" and n_kv_heads is not None):
-            self.attn = GroupedQueryAttention(d_model, n_heads, n_kv_heads, use_rope)
-        else:
-            raise ValueError(f"unknown attention mode: {mode}")
+        self.attn = build_attention(d_model, n_heads, n_kv_heads, use_rope, self.config)
 
         #self.ln2 = nn.LayerNorm(d_model)
         self.ln2 = RMSNorm(d_model)
-        # TODO(MoE): replace this dense SwiGLU with a selectable MLP implementation:
-        # dense SwiGLU, Switch-style top-1 MoE, Mixtral-style top-2 MoE, and later
-        # shared-plus-routed experts inspired by DeepSeekMoE.
-        self.mlp = SwiGLU(d_model)
+        self.mlp = build_mlp(d_model, layer_id, self.config)
         
     
     def forward(self, x, mask=None):
+        self.last_aux_loss = None
+        self.last_stats = {}
+
         x = x + self.attn(self.ln1(x), mask)
-        x = x + self.mlp(self.ln2(x))
+        mlp_out = self.mlp(self.ln2(x))
+        if isinstance(mlp_out, tuple):
+            mlp_out, aux_loss, stats = mlp_out
+            self.last_aux_loss = aux_loss
+            self.last_stats = stats or {}
+
+        # TODO(nanoDSV4-mHC): when use_mhc=True, replace this simple residual
+        # stream with multi-head hyper-connections that mix several residual
+        # streams per layer. Keep use_attention_residual as a separate option so
+        # Kimi-style attention residuals can be compared against mHC directly.
+        x = x + mlp_out
         return x
 
 class SwiGLU(nn.Module):
     def __init__(self, d_model):
         super().__init__()
 
-        # TODO(MoE): keep this class as the single expert implementation so dense
-        # MLP and sparse experts use identical feed-forward math.
+        # TODO(nanoDSV4-MoE): keep this class as the expert implementation used
+        # by dense MLP, shared experts, and routed experts so experiments compare
+        # routing/topology rather than different feed-forward math.
         hidden_dim = int((8/3) * d_model)
         hidden_dim = 64 * ((hidden_dim + 64 - 1) // 64)
 
@@ -131,28 +167,74 @@ class SwiGLU(nn.Module):
         return self.down_proj(self.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-# TODO(MoE): add a small Router module:
-# - project token states from d_model -> num_experts
-# - compute router logits/probabilities in fp32
-# - support noisy routing during training
-# - return top_k expert ids, routing weights, and router diagnostics.
+def build_attention(d_model, n_heads, n_kv_heads, use_rope, config):
+    attention_impl = config.get("attention_impl", config.get("mode", "mha"))
+    sparse_impl = config.get("sparse_attention_impl", "none")
+
+    if sparse_impl in {"sliding", "csa", "hca", "alternating_csa_hca"}:
+        raise NotImplementedError(
+            "TODO(nanoDSV4-sparse-attn): implement sliding-window attention, "
+            "compressed block selection for CSA, pooled global context for HCA, "
+            "and layer schedules for alternating CSA/HCA."
+        )
+    if attention_impl == "mha":
+        return MultiHeadAttention(d_model, n_heads, use_rope)
+    if attention_impl == "gqa" and n_kv_heads is not None:
+        return GroupedQueryAttention(d_model, n_heads, n_kv_heads, use_rope)
+    if attention_impl == "mla":
+        raise NotImplementedError(
+            "TODO(nanoDSV4-MLA): implement MultiHeadLatentAttention with "
+            "q/kv low-rank projections, RoPE/NoPE split, latent KV cache, "
+            "and absorbed inference projections."
+        )
+    raise ValueError(f"unknown attention implementation: {attention_impl}")
+
+
+def build_mlp(d_model, layer_id, config):
+    mlp_impl = config.get("mlp_impl", "dense")
+    frequency = config.get("moe_layer_frequency", 0)
+
+    if mlp_impl == "dense":
+        return SwiGLU(d_model)
+    use_moe_layer = frequency <= 0 or (layer_id + 1) % frequency == 0
+    if not use_moe_layer:
+        return SwiGLU(d_model)
+    if mlp_impl == "deepseek_moe":
+        raise NotImplementedError(
+            "TODO(nanoDSV4-MoE): implement DeepSeekMoE with shared experts, "
+            "fine-grained routed experts, top-k routing, capacity/drop policy, "
+            "global and sequence-level balance losses, router z-loss, optional "
+            "aux-loss-free balancing, and per-layer utilization stats."
+        )
+    raise ValueError(f"unknown MLP implementation: {mlp_impl}")
+
+
+# TODO(nanoDSV4-Router): add a Router module:
+# - project token states from d_model -> num_routed_experts in fp32
+# - support top-k routing with temperature and optional training noise
+# - return expert ids, normalized route weights, router logits, and diagnostics
+# - compute z-loss, global balance loss, sequence balance loss, and dropped-token
+#   stats without hiding LM loss regressions.
 #
-# TODO(MoE): add SwitchMoE / Top1MoE first:
-# - flatten (B, T, C) tokens
-# - send each token to its top-1 expert
-# - implement capacity_factor and either token dropping or residual fallback
-# - compute load-balancing loss and router z-loss.
+# TODO(nanoDSV4-DeepSeekMoE): add DeepSeekMoE:
+# - always run num_shared_experts shared SwiGLU experts
+# - dispatch tokens to fine-grained routed SwiGLU experts
+# - combine shared and routed outputs with stable scaling
+# - start with simple per-expert loops, then add grouped/dropless dispatch
+# - log expert specialization by dataset source, token position, and prompt type.
 #
-# TODO(MoE): add MixtralMoE / Top2MoE second:
-# - route each token to two experts
-# - combine expert outputs with normalized router weights
-# - log expert utilization so collapse is obvious during small runs.
+# TODO(nanoDSV4-MLA): add MultiHeadLatentAttention:
+# - implement q down/up projection and compressed kv latent projection
+# - split query/key heads into RoPE and NoPE dimensions
+# - expose KV cache byte counts versus MHA/GQA
+# - add an inference path with absorbed projections after correctness tests pass.
 #
-# TODO(MoE): add frontier-style variants after the basic MoE works:
-# - dropless grouped dispatch
-# - shared expert plus routed experts
-# - fine-grained experts with more smaller experts selected per token
-# - expert-parallel dispatch across GPUs.
+# TODO(nanoDSV4-CSA-HCA): add long-context attention variants:
+# - local dense/sliding attention for nearby tokens
+# - CSA: compressed block summaries plus top-k block retrieval
+# - HCA: heavier pooling/register compression for global context
+# - mHC: multi-head hyper-connections as a depth/optimization option
+# - attention residuals: separate Kimi-style comparison flag.
 
 class GeLU_MLP(nn.Module):
     def __init__(self, d_model):
@@ -235,4 +317,3 @@ class MultiHeadAttention(nn.Module):
 
         out = combine_heads(q, k, v, mask)
         return self.out_proj(out)
-

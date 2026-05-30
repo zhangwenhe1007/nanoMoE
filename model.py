@@ -1,17 +1,72 @@
+from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import math
+from config import normalize_model_config
 from transformer import Transformer, RMSNorm
 
 
+@dataclass
+class GPTOutput:
+    logits: torch.Tensor
+    aux_loss: torch.Tensor | None = None
+    stats: dict | None = None
+
+
 class GPT(nn.Module):
-    def __init__(self, vocab_size, block_size, d_model, n_heads, n_layers, n_kv_heads=None, mode="mha", pos_encoding="rope"):
+    def __init__(
+        self,
+        vocab_size,
+        block_size,
+        d_model,
+        n_heads,
+        n_layers,
+        n_kv_heads=None,
+        mode="mha",
+        pos_encoding="rope",
+        model_config=None,
+    ):
         super().__init__()
 
-        self.block_size = block_size
-        # TODO(MoE): add model-level MoE config here, e.g. mlp_mode, num_experts,
-        # top_k, capacity_factor, aux_loss_weight, router_z_loss_weight,
-        # shared_experts, and moe_layer_frequency.
+        config = normalize_model_config(model_config or {
+            "vocab_size": vocab_size,
+            "block_size": block_size,
+            "d_model": d_model,
+            "n_heads": n_heads,
+            "n_layers": n_layers,
+            "n_kv_heads": n_kv_heads,
+            "mode": mode,
+            "attention_impl": mode,
+            "pos_encoding": pos_encoding,
+        })
+        self.config = config
+        self.block_size = config["block_size"]
+        block_size = config["block_size"]
+        vocab_size = config["vocab_size"]
+        d_model = config["d_model"]
+        n_heads = config["n_heads"]
+        n_layers = config["n_layers"]
+        n_kv_heads = config["n_kv_heads"]
+        mode = config["mode"]
+        pos_encoding = config["pos_encoding"]
+        self.last_aux_loss = None
+        self.last_stats = {}
+
+        # TODO(nanoDSV4-MLA): model_config should become the single source of
+        # truth for MLA dims, RoPE/NoPE split, latent KV cache size, and whether
+        # inference uses absorbed KV projections.
+        #
+        # TODO(nanoDSV4-MoE): wire DeepSeekMoE config into every block: shared
+        # experts, fine-grained routed experts, top-k routing, router noise,
+        # global/sequence balance losses, z-loss, and aux-loss-free balancing.
+        #
+        # TODO(nanoDSV4-sparse-attn): route long-context layers through dense,
+        # sliding-window, CSA, HCA, or alternating CSA/HCA attention according to
+        # config instead of hard-coding one attention class.
+        #
+        # TODO(nanoDSV4-posttrain): preserve architecture/post-training metadata
+        # in checkpoints so SFT, reasoning distillation, and GRPO can resume the
+        # exact same model family.
         
         self.token_embedding = nn.Embedding(vocab_size, d_model)
 
@@ -27,9 +82,15 @@ class GPT(nn.Module):
         else:
             raise ValueError(f"unknown positional encoding: {pos_encoding}")
 
-        # TODO(MoE): pass the MoE config into Transformer so individual blocks can
-        # choose dense SwiGLU vs sparse expert MLPs without changing attention code.
-        self.transformer = Transformer(d_model, n_heads, n_layers, n_kv_heads, mode, use_rope)
+        self.transformer = Transformer(
+            d_model,
+            n_heads,
+            n_layers,
+            n_kv_heads,
+            mode,
+            use_rope,
+            config=config,
+        )
         #self.ln_f = nn.LayerNorm(d_model)
         self.ln_f = RMSNorm(d_model)
 
@@ -38,7 +99,7 @@ class GPT(nn.Module):
         #weight tying
         self.lm_head.weight = self.token_embedding.weight
     
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, return_output=False):
         """
         idx:     (B, T)
         targets: (B, T), optional
@@ -61,12 +122,18 @@ class GPT(nn.Module):
         mask = torch.tril(torch.ones(T, T, device=idx.device))
         mask = mask.view(1, 1, T, T)
 
-        # TODO(MoE): when MoE blocks are implemented, return or store router aux
-        # losses/statistics from the transformer in addition to logits.
+        # TODO(nanoDSV4-output): once MLA/MoE/sparse attention are live, return a
+        # GPTOutput by default from training paths and keep generation on logits.
+        # Include lm_loss, aux_loss, router stats, attention compression stats,
+        # active parameters, and KV-cache bytes in the structured output.
         x = self.transformer(x, mask)
+        self.last_aux_loss = self.transformer.last_aux_loss
+        self.last_stats = self.transformer.last_stats
         x = self.ln_f(x)
 
         logits = self.lm_head(x)
+        if return_output:
+            return GPTOutput(logits=logits, aux_loss=self.last_aux_loss, stats=self.last_stats)
         return logits
 
     @torch.no_grad()
@@ -75,6 +142,8 @@ class GPT(nn.Module):
             idx_cond = idx[:, -self.block_size:]
 
             logits = self(idx_cond)    # (B, T, vocab_size)
+            if isinstance(logits, GPTOutput):
+                logits = logits.logits
             logits = logits[:, -1, :]  # (B, vocab_size)
 
             if top_k is not None:

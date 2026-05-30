@@ -1,0 +1,7 @@
+datasets
+numpy
+tiktoken
+tqdm
+
+# Install the PyTorch build that matches your cluster CUDA version separately:
+# https://pytorch.org/get-started/locally/

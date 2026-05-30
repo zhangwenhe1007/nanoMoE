@@ -93,6 +93,9 @@ def normalize_sources(sources):
 def build_sources(args):
     sources = []
 
+    # TODO(nanoDSV4-anneal): make annealing data progressively higher quality:
+    # more educational/factual/code/math late in training, less noisy web text,
+    # and explicit eval sets for basic facts, sentence coherence, and arithmetic.
     fineweb_formatter = lambda ex: format_fineweb_edu(ex, args.min_fineweb_score)
     sources.append(make_source(
         "fineweb_edu",

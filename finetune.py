@@ -11,6 +11,7 @@ from torch.utils.data.distributed import DistributedSampler
 import tiktoken
 from tqdm import tqdm
 
+from config import normalize_model_config
 from model import GPT
 from schedulers import WarmupCosineScheduler
 
@@ -185,8 +186,10 @@ def show_debug_batch(dataset, enc, count=2):
 
 
 def masked_cross_entropy(logits, targets, loss_mask):
-    # TODO(MoE): keep response-only LM loss masked, but decide whether router
-    # balancing losses should see prompt tokens, response tokens, or all tokens.
+    # TODO(nanoDSV4-SFT): keep response-only LM loss masked, but make a deliberate
+    # choice for architecture losses. Router balance and sparse-attention stats
+    # probably should see all non-padding tokens, while supervised LM loss should
+    # stay response-only.
     B, T, C = logits.shape
     loss = F.cross_entropy(
         logits.view(B * T, C),
@@ -211,8 +214,11 @@ def estimate_loss(model, loader, device, max_batches=50):
         y = y.to(device)
         loss_mask = loss_mask.to(device)
 
-        # TODO(MoE): handle logits plus router aux losses/statistics during SFT.
-        logits = model(x)
+        # TODO(nanoDSV4-eval): add exact-answer reasoning evals here before GRPO:
+        # arithmetic, GSM8K-style final-answer extraction, short factual QA, and
+        # simple code tests. Samples are useful, but they are not a metric.
+        output = model(x, return_output=True)
+        logits = output.logits
         loss = masked_cross_entropy(logits, y, loss_mask)
         losses.append(loss.item())
 
@@ -224,14 +230,12 @@ def load_pretrained_model(checkpoint_path, fallback_config, device):
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        model_config = checkpoint["model_config"]
+        model_config = normalize_model_config(checkpoint["model_config"])
         state_dict = checkpoint["model_state_dict"]
     else:
-        model_config = fallback_config
+        model_config = normalize_model_config(fallback_config)
         state_dict = checkpoint
 
-    # TODO(MoE): pass any saved MoE config through to GPT so SFT can continue a
-    # sparse checkpoint without silently falling back to dense SwiGLU blocks.
     model = GPT(
         vocab_size=model_config["vocab_size"],
         block_size=model_config["block_size"],
@@ -241,6 +245,7 @@ def load_pretrained_model(checkpoint_path, fallback_config, device):
         n_kv_heads=model_config["n_kv_heads"],
         mode=model_config["mode"],
         pos_encoding=model_config["pos_encoding"],
+        model_config=model_config,
     )
     model.load_state_dict(state_dict)
     return model, model_config
@@ -282,16 +287,14 @@ def main():
         "n_kv_heads": 2,
         "mode": "gqa",
         "pos_encoding": "rope",
-        # TODO(MoE): add dense fallback defaults for new MoE config fields so old
-        # nanoGPT checkpoints remain loadable during migration experiments.
     }
+    fallback_config = normalize_model_config(fallback_config)
 
     start_step = 0
     resume_checkpoint = None
     if args.resume_from:
         resume_checkpoint = torch.load(args.resume_from, map_location=device)
-        model_config = resume_checkpoint["model_config"]
-        # TODO(MoE): reconstruct router/expert modules from checkpoint config.
+        model_config = normalize_model_config(resume_checkpoint["model_config"])
         model = GPT(
             vocab_size=model_config["vocab_size"],
             block_size=model_config["block_size"],
@@ -301,6 +304,7 @@ def main():
             n_kv_heads=model_config["n_kv_heads"],
             mode=model_config["mode"],
             pos_encoding=model_config["pos_encoding"],
+            model_config=model_config,
         )
         model.load_state_dict(resume_checkpoint["model_state_dict"])
         start_step = resume_checkpoint.get("step", -1) + 1
@@ -310,6 +314,8 @@ def main():
         if args.checkpoint is None:
             raise ValueError("--checkpoint is required unless --resume-from is set")
         model, model_config = load_pretrained_model(args.checkpoint, fallback_config, device)
+
+    enc = tiktoken.get_encoding(model_config.get("tokenizer_name", "gpt2"))
 
     model = model.to(device)
 
@@ -433,10 +439,15 @@ def main():
                 dtype=torch.bfloat16,
                 enabled=autocast_device_type == "cuda",
             ):
-                # TODO(MoE): add router aux loss to masked LM loss and log router
-                # diagnostics during instruction tuning.
-                logits = model(x)
-                loss = masked_cross_entropy(logits, y, loss_mask)
+                # TODO(nanoDSV4-SFT-loss): add router/sparse-attention aux losses
+                # to masked LM loss, but log LM loss separately. Instruction
+                # tuning should improve sentence-following without hiding router
+                # collapse or long-context regressions.
+                output = model(x, return_output=True)
+                logits = output.logits
+                lm_loss = masked_cross_entropy(logits, y, loss_mask)
+                aux_loss = output.aux_loss
+                loss = lm_loss if aux_loss is None else lm_loss + aux_loss
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -444,7 +455,7 @@ def main():
             optimizer.step()
 
             if is_main_process:
-                pbar.set_description(f"loss {loss.item():.4f} lr {lr:.2e}")
+                pbar.set_description(f"loss {loss.item():.4f} lm {lm_loss.item():.4f} lr {lr:.2e}")
                 pbar.update(1)
 
             if is_main_process and step > 0 and step % args.save_interval == 0:

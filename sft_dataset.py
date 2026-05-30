@@ -404,6 +404,10 @@ def format_wildchat(ex):
 
 
 def source_specs(mode):
+    # TODO(nanoDSV4-posttrain): add a reasoning curriculum separate from general
+    # chat SFT: short chain-of-thought traces, final-answer-only variants,
+    # verifier-friendly math/QA/code tasks, and rejected/accepted samples for
+    # later GRPO. Keep contamination checks for benchmark-like questions.
     qa = [
         ("squad", "qa", 0.35, "rajpurkar/squad", format_squad, None, "train"),
         ("natural_questions", "qa", 0.25, "rojagtap/natural_questions_clean", format_natural_questions_clean, None, "train"),
