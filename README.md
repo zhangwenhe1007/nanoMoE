@@ -143,16 +143,38 @@ python train.py \
   --model-preset dense_360m \
   --tokenizer-name cl100k_base \
   --target-tokens 12000000000 \
-  --batch-size 8 \
-  --grad-accum-steps 64 \
+  --batch-size 32 \
+  --grad-accum-steps 8 \
   --dtype bf16 \
-  --compile
+  --compile \
+  --num-workers 8
 ```
 
 The dataset builder writes many shard files plus `manifest.json`. At
 `250M` tokens per shard, `cl100k_base` uses roughly 1 GB per shard, so 12B tokens
 is about 48 shards. GPT-2 BPE shards are roughly half that size because they use
 `uint16`.
+
+For a 2x B200 run, start with:
+
+```bash
+torchrun --standalone --nproc_per_node=2 train.py \
+  --data-path clean_12b_cl100k \
+  --model-preset dense_360m \
+  --tokenizer-name cl100k_base \
+  --target-tokens 12000000000 \
+  --batch-size 32 \
+  --grad-accum-steps 8 \
+  --dtype bf16 \
+  --compile \
+  --num-workers 8
+```
+
+If memory allows, prefer larger per-GPU batches and lower accumulation, such as
+`--batch-size 64 --grad-accum-steps 4`. The tokens per optimizer step stay the
+same, but fewer microsteps usually improves GPU utilization. Sharded pretraining
+data is not shuffled by default because the corpus builder already mixes
+documents; this keeps memory-mapped reads mostly sequential.
 
 After this baseline forms coherent English, compare:
 

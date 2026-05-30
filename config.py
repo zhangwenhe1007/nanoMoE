@@ -1,6 +1,8 @@
 DEFAULT_MODEL_CONFIG = {
     "architecture_target": "nano_dsv4",
     "tokenizer_name": "gpt2",
+    "tokenizer_vocab_size": None,
+    "pad_vocab_multiple": 128,
     "vocab_size": None,
     "block_size": 512,
     "d_model": 512,
@@ -91,6 +93,8 @@ def normalize_model_config(config):
     normalized.update(config)
 
     # Backward compatibility with existing checkpoints and CLI names.
+    if normalized.get("tokenizer_vocab_size") is None:
+        normalized["tokenizer_vocab_size"] = normalized.get("vocab_size")
     normalized["attention_impl"] = normalized.get("attention_impl") or normalized.get("mode", "gqa")
     normalized["mode"] = normalized.get("mode") or normalized["attention_impl"]
     normalized["pos_encoding"] = normalized.get("pos_encoding", "rope")
@@ -119,9 +123,17 @@ def apply_model_preset(args):
 
 
 def build_model_config(args, vocab_size):
+    padded_vocab_size = vocab_size
+    if args.pad_vocab_multiple > 1:
+        padded_vocab_size = args.pad_vocab_multiple * (
+            (vocab_size + args.pad_vocab_multiple - 1) // args.pad_vocab_multiple
+        )
+
     config = dict(DEFAULT_MODEL_CONFIG)
     config.update({
-        "vocab_size": vocab_size,
+        "tokenizer_vocab_size": vocab_size,
+        "pad_vocab_multiple": args.pad_vocab_multiple,
+        "vocab_size": padded_vocab_size,
         "tokenizer_name": args.tokenizer_name,
         "block_size": args.block_size,
         "d_model": args.d_model,

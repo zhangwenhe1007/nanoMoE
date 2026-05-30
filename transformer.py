@@ -1,57 +1,47 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
-#Attention helpers
-def attention(q, k, v, mask=None):
-    """
-    q: (B, H, T, d_head)
-    k: (B, H, T, d_head)
-    v: (B, H, T, d_head)
-    """
-
-    scores = (q @ k.transpose(-2, -1))/q.shape[-1] ** 0.5
-    if mask is not None:
-        scores = scores.masked_fill(mask == 0, -float("inf"))
-    attn_weights = nn.functional.softmax(scores, dim=-1)
-    return attn_weights @ v
-
-def combine_heads(q, k, v, mask=None):
-    out = attention(q, k, v, mask)   # (B, H, T, d_h)
+def sdpa_combine_heads(q, k, v):
+    out = F.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=True,
+    )
     B, H, T, d_h = out.shape
 
     out = out.transpose(1,2).contiguous()
     out = out.reshape(B, T, H * d_h)
     return out
 
-#RoPE
-def apply_rope(x):
-    # x: (B, H, T, d_head)
-    B, H, T, d_head = x.shape
 
-    assert d_head % 2 == 0
-    n_pairs = d_head//2
-    
-    x = x.view(B, H, T, n_pairs, 2)
+class RotaryEmbedding(nn.Module):
+    def __init__(self, d_head, max_position):
+        super().__init__()
+        assert d_head % 2 == 0
+        n_pairs = d_head // 2
+        pos = torch.arange(max_position, dtype=torch.float32).unsqueeze(1)
+        i = torch.arange(n_pairs, dtype=torch.float32)
+        theta = 10000 ** (-2 * i / d_head)
+        angles = pos * theta.unsqueeze(0)
+        self.register_buffer("cos", torch.cos(angles)[None, None, :, :], persistent=False)
+        self.register_buffer("sin", torch.sin(angles)[None, None, :, :], persistent=False)
 
-    x_even = x[..., 0]
-    x_odd = x[..., 1]
-
-    pos = torch.arange(T, device=x.device)
-    i = torch.arange(n_pairs, device=x.device)
-
-    theta = 10000 ** (-2 * i / d_head)
-    angles = pos[:, None] * theta[None, :]
-
-    cos = torch.cos(angles)[None, None, :, :]
-    sin = torch.sin(angles)[None, None, :, :]
-
-    x_rot_even = x_even * cos - x_odd * sin
-    x_rot_odd = x_even * sin + x_odd * cos
-
-    x_rot = torch.stack([x_rot_even, x_rot_odd], dim=-1)
-
-    return x_rot.view(B, H, T, d_head)
+    def forward(self, x):
+        B, H, T, d_head = x.shape
+        n_pairs = d_head // 2
+        x = x.view(B, H, T, n_pairs, 2)
+        x_even = x[..., 0]
+        x_odd = x[..., 1]
+        cos = self.cos[:, :, :T, :].to(dtype=x.dtype, device=x.device)
+        sin = self.sin[:, :, :T, :].to(dtype=x.dtype, device=x.device)
+        x_rot_even = x_even * cos - x_odd * sin
+        x_rot_odd = x_even * sin + x_odd * cos
+        return torch.stack([x_rot_even, x_rot_odd], dim=-1).view(B, H, T, d_head)
 
 
 class RMSNorm(nn.Module):
@@ -178,9 +168,9 @@ def build_attention(d_model, n_heads, n_kv_heads, use_rope, config):
             "and layer schedules for alternating CSA/HCA."
         )
     if attention_impl == "mha":
-        return MultiHeadAttention(d_model, n_heads, use_rope)
+        return MultiHeadAttention(d_model, n_heads, use_rope, config)
     if attention_impl == "gqa" and n_kv_heads is not None:
-        return GroupedQueryAttention(d_model, n_heads, n_kv_heads, use_rope)
+        return GroupedQueryAttention(d_model, n_heads, n_kv_heads, use_rope, config)
     if attention_impl == "mla":
         raise NotImplementedError(
             "TODO(nanoDSV4-MLA): implement MultiHeadLatentAttention with "
@@ -248,7 +238,7 @@ class GeLU_MLP(nn.Module):
     
 
 class GroupedQueryAttention(nn.Module):
-    def __init__(self, d_model, n_q_heads, n_kv_heads, use_rope):
+    def __init__(self, d_model, n_q_heads, n_kv_heads, use_rope, config=None):
         super().__init__()
 
         assert d_model % n_q_heads == 0
@@ -258,6 +248,7 @@ class GroupedQueryAttention(nn.Module):
         self.n_q_heads = n_q_heads
         self.n_kv_heads = n_kv_heads
         self.use_rope = use_rope
+        self.rope = RotaryEmbedding(self.d_head, (config or {}).get("block_size", 1024)) if use_rope else None
 
         self.q_proj = nn.Linear(d_model, n_q_heads * self.d_head)
         self.k_proj = nn.Linear(d_model, n_kv_heads * self.d_head)
@@ -275,21 +266,23 @@ class GroupedQueryAttention(nn.Module):
         v = v.view(B, T, self.n_kv_heads, self.d_head).transpose(1, 2)
 
         if self.use_rope:
-            q = apply_rope(q)
-            k = apply_rope(k)
+            q = self.rope(q)
+            k = self.rope(k)
 
         k = k.repeat_interleave(self.group_size, dim=1)
         v = v.repeat_interleave(self.group_size, dim=1)
 
-        out = combine_heads(q, k, v, mask)
+        out = sdpa_combine_heads(q, k, v)
         return self.out_proj(out)
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model, n_heads, use_rope):
+    def __init__(self, d_model, n_heads, use_rope, config=None):
         super().__init__()
         self.n_heads = n_heads
         self.use_rope = use_rope
+        self.d_head = d_model // n_heads
+        self.rope = RotaryEmbedding(self.d_head, (config or {}).get("block_size", 1024)) if use_rope else None
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
@@ -305,15 +298,15 @@ class MultiHeadAttention(nn.Module):
         H = self.n_heads
         
         assert d_model % H == 0
-        d_head = d_model // H
+        d_head = self.d_head
 
         q = q.view(B, T, H, d_head).transpose(1, 2)
         k = k.view(B, T, H, d_head).transpose(1, 2)
         v = v.view(B, T, H, d_head).transpose(1, 2)
 
         if self.use_rope:
-            q = apply_rope(q)
-            k = apply_rope(k)
+            q = self.rope(q)
+            k = self.rope(k)
 
-        out = combine_heads(q, k, v, mask)
+        out = sdpa_combine_heads(q, k, v)
         return self.out_proj(out)

@@ -23,6 +23,7 @@ def parse_args():
     parser.add_argument("--data-path", type=str, default="mixed_train.txt")
     parser.add_argument("--model-preset", type=str, default="dense_360m", choices=sorted(MODEL_PRESETS))
     parser.add_argument("--tokenizer-name", type=str, default="gpt2", choices=["gpt2", "cl100k_base", "o200k_base"])
+    parser.add_argument("--pad-vocab-multiple", type=int, default=128)
     parser.add_argument("--block-size", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--grad-accum-steps", type=int, default=8)
@@ -65,6 +66,11 @@ def parse_args():
     parser.add_argument("--beta2", type=float, default=0.95)
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
+    parser.add_argument("--no-pin-memory", action="store_true")
+    parser.add_argument("--shuffle-data", action="store_true")
+    parser.add_argument("--no-ddp-static-graph", action="store_true")
     parser.add_argument("--eval-interval", type=int, default=1000)
     parser.add_argument("--sample-interval", type=int, default=3000)
     parser.add_argument("--save-interval", type=int, default=5000)
@@ -164,8 +170,8 @@ def estimate_loss(model, loader, device, max_batches=50):
         if i >= max_batches:
             break
 
-        x = x.to(device)
-        y = y.to(device)
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
 
         # TODO(nanoDSV4-eval): log dense validation loss separately from router
         # losses and attention compression stats. Reasoning improvements should
@@ -194,6 +200,11 @@ def autocast_dtype(args):
 
 def main():
     args = parse_args()
+    torch.set_float32_matmul_precision("high")
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     ddp, rank, local_rank, world_size, device = setup_distributed()
     is_main_process = rank == 0
     autocast_device_type = "cuda" if str(device).startswith("cuda") else "cpu"
@@ -230,6 +241,9 @@ def main():
         "betas": [args.beta1, args.beta2],
         "dtype": args.dtype,
         "compile": args.compile,
+        "num_workers": args.num_workers,
+        "pin_memory": not args.no_pin_memory,
+        "shuffle_data": args.shuffle_data,
         "relative_lr": args.relative_lr,
         "world_size": world_size,
         # TODO(nanoDSV4-data): store dataset mixture metadata, token count,
@@ -242,16 +256,32 @@ def main():
     val_dataset = TextDataset(args.data_path, args.block_size, split="val", tokenizer_name=args.tokenizer_name)
 
     train_sampler = (
-        DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=args.shuffle_data)
         if ddp else None
     )
+    loader_kwargs = {
+        "num_workers": args.num_workers,
+        "pin_memory": torch.cuda.is_available() and not args.no_pin_memory,
+        "persistent_workers": args.num_workers > 0,
+    }
+    if args.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = args.prefetch_factor
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=(train_sampler is None),
+        shuffle=(train_sampler is None and args.shuffle_data),
         sampler=train_sampler,
+        drop_last=True,
+        **loader_kwargs,
     )
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        drop_last=True,
+        **loader_kwargs,
+    )
 
     model = GPT(
         vocab_size=model_config["vocab_size"],
@@ -288,7 +318,12 @@ def main():
         model = torch.compile(model)
 
     if ddp:
-        model = DDP(model, device_ids=[local_rank])
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            gradient_as_bucket_view=True,
+            static_graph=not args.no_ddp_static_graph,
+        )
 
     optimizer = build_optimizer(model, args)
     scheduler_max_steps = args.max_steps
@@ -380,8 +415,8 @@ def main():
                 if micro_step > 0:
                     x, y = next(data_iter)
 
-                x = x.to(device)
-                y = y.to(device)
+                x = x.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
 
                 if ddp:
                     model.require_backward_grad_sync = micro_step == args.grad_accum_steps - 1

@@ -41,6 +41,7 @@ class GPT(nn.Module):
         })
         self.config = config
         self.block_size = config["block_size"]
+        self.tokenizer_vocab_size = config.get("tokenizer_vocab_size") or config["vocab_size"]
         block_size = config["block_size"]
         vocab_size = config["vocab_size"]
         d_model = config["d_model"]
@@ -119,14 +120,11 @@ class GPT(nn.Module):
         else:
             x = tok_emb
 
-        mask = torch.tril(torch.ones(T, T, device=idx.device))
-        mask = mask.view(1, 1, T, T)
-
         # TODO(nanoDSV4-output): once MLA/MoE/sparse attention are live, return a
         # GPTOutput by default from training paths and keep generation on logits.
         # Include lm_loss, aux_loss, router stats, attention compression stats,
         # active parameters, and KV-cache bytes in the structured output.
-        x = self.transformer(x, mask)
+        x = self.transformer(x)
         self.last_aux_loss = self.transformer.last_aux_loss
         self.last_stats = self.transformer.last_stats
         x = self.ln_f(x)
@@ -145,6 +143,8 @@ class GPT(nn.Module):
             if isinstance(logits, GPTOutput):
                 logits = logits.logits
             logits = logits[:, -1, :]  # (B, vocab_size)
+            if self.tokenizer_vocab_size < logits.shape[-1]:
+                logits[:, self.tokenizer_vocab_size:] = -float("inf")
 
             if top_k is not None:
                 top_k = min(top_k, logits.shape[-1])
